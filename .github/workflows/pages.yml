@@ -1,0 +1,49 @@
+# Publishes the app + the Stremio addon to GitHub Pages.
+# Runs on every push, on demand, and every 30 minutes so the addon's "On Now" row stays current.
+# One-time setup: Settings → Pages → Build and deployment → Source: "GitHub Actions".
+name: Build site & Stremio addon
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pages
+        uses: actions/configure-pages@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build addon
+        run: node addon/build.js --out _site
+        env:
+          ADDON_TZ: America/Chicago          # time zone for the TV schedule
+          ADDON_BASE_URL: ${{ steps.pages.outputs.base_url }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
