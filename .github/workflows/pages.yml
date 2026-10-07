@@ -22,8 +22,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # Remember episode/movie data between runs so the holiday row doesn't re-fetch hundreds of shows every time
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: ns-cache-${{ github.run_id }}
+          restore-keys: ns-cache-
       - id: pages
         uses: actions/configure-pages@v5
       - uses: actions/setup-node@v4
