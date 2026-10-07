@@ -10,14 +10,18 @@
  * Output (relative to --out):
  *   index.html                        the app itself (copied)
  *   addon/manifest.json               install this URL in Stremio
- *   addon/catalog/series/<id>.json    one file per catalog
+ *   addon/catalog/<type>/<id>.json    one file per catalog (series and movie)
  *   addon/logo.png                    (copied if present)
  *
  * Env:
  *   ADDON_TZ   time zone for the TV schedule (default America/Chicago)
  *   ADDON_NOW  override "now" (ms or ISO date) — for testing
  *
- * Needs Node 18+ (built-in fetch). --offline skips TVmaze lookups (no episode titles in "On Now").
+ *   ADDON_CACHE            where episode/movie data is cached between runs (default .cache/ns-cache.json)
+ *   ADDON_FETCH_BUDGET_MS  how long one run may spend fetching (default 150000)
+ *
+ * Needs Node 18+ (built-in fetch). --offline skips all network lookups and uses only the cache.
+ * Episode lists are cached for a week; each run refreshes a batch, so the holiday row fills in over a run or two.
  */
 'use strict';
 const fs = require('fs');
@@ -29,7 +33,10 @@ const OFFLINE = args.includes('--offline');
 const ROOT = path.resolve(__dirname, '..');
 const TZ = process.env.ADDON_TZ || 'America/Chicago';
 const NOW = process.env.ADDON_NOW ? (isNaN(+process.env.ADDON_NOW) ? Date.parse(process.env.ADDON_NOW) : +process.env.ADDON_NOW) : Date.now();
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+const CACHE_FILE = path.resolve(process.env.ADDON_CACHE || path.join(ROOT, '.cache', 'ns-cache.json'));
+const FETCH_BUDGET_MS = +(process.env.ADDON_FETCH_BUDGET_MS || 150000);   // max time per run spent refreshing data
+const PACE_MS = +(process.env.ADDON_PACE_MS || 550);                         // gap between requests (TVmaze allows 20 / 10 s)
 
 // ---------- Data: read the arrays out of index.html ----------
 const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
@@ -109,42 +116,162 @@ function onAir(ch, ts) {
     return { now: cur, next: null };
 }
 
-// ---------- Episodes (TVmaze) ----------
+// ---------- Network (paced for TVmaze's 20 requests / 10 s) ----------
+let lastReq = 0;
 async function getJSON(url, tries = 3) {
     for (let i = 0; i < tries; i++) {
+        const wait = lastReq + PACE_MS - Date.now();
+        if (wait > 0) await new Promise(res => setTimeout(res, wait));
+        lastReq = Date.now();
         const r = await fetch(url, { headers: { 'User-Agent': 'NowShowing-Addon-Builder' } });
-        if (r.status === 429) { await new Promise(res => setTimeout(res, 2500)); continue; }
-        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+        if (r.status === 429) { await new Promise(res => setTimeout(res, 3000)); continue; }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
     }
-    throw new Error(`Rate-limited: ${url}`);
+    throw new Error('rate-limited');
 }
-const epCache = new Map();
-async function episodesFor(show) {
-    const k = imdbOf(show);
-    if (epCache.has(k)) return epCache.get(k);
-    let eps = [];
-    try {
-        const known = byImdb.get(k) || (show.id && typeof show.id === 'number' ? show : null);
-        const parts = known
-            ? (known.sub_shows || [{ id: known.id, seasons: known.seasons }])
-            : [{ id: (await getJSON(`https://api.tvmaze.com/lookup/shows?imdb=${k}`)).id, seasons: null }];
-        for (const p of parts) {
-            const list = await getJSON(`https://api.tvmaze.com/shows/${p.id}/episodes`);
-            const today = new Date(NOW).toISOString().slice(0, 10);
-            eps.push(...list.filter(e => e.season && e.number && (!e.airdate || e.airdate <= today) && (!p.seasons || p.seasons.includes(e.season))));
+
+// ---------- Cache (kept between runs by the GitHub workflow) ----------
+let CACHE = { v: 1, shows: {}, cine: {} };
+try { const c = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); if (c && c.v === 1) CACHE = Object.assign(CACHE, c); } catch (e) { /* first run */ }
+const SHOW_TTL = 7 * 864e5, FAIL_TTL = 864e5, CINE_TTL = 20 * 3600e3;
+const runStart = Date.now();
+const budgetLeft = () => !OFFLINE && Date.now() - runStart < FETCH_BUDGET_MS;
+const isFresh = (rec, ttl) => rec && NOW - rec.t < (rec.err ? FAIL_TTL : ttl);
+function saveCache() {
+    try { fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true }); fs.writeFileSync(CACHE_FILE, JSON.stringify(CACHE)); }
+    catch (e) { console.warn('  ! could not save cache:', e.message); }
+}
+
+// ---------- Holidays (same windows and keywords as the app's Holiday Mode) ----------
+const HOLIDAYS = [
+    { id: 'halloween', name: 'Halloween', emoji: '🎃', start: [10, 1], end: [11, 1], movieGenre: 'Horror',
+      strong: /hallo[wv]e+n|treehouse of horror|trick[- ]?or[- ]?treat|all hallows|d[ií]a de (los )?muertos|samhain/i },
+    { id: 'thanksgiving', name: 'Thanksgiving', emoji: '🦃', start: [11, 2], end: [11, 30], movieGenre: 'Family', movieSearch: 'thanksgiving',
+      strong: /thanksgiving|friendsgiving|turkey day|pilgrims?\b/i },
+    { id: 'christmas', name: 'Christmas', emoji: '🎄', start: [12, 1], end: [12, 26], movieGenre: 'Family', movieSearch: 'christmas',
+      strong: /christmas|x-?mas|santa\b|santa's|yule|festivus|hanukk?ah|chanukk?ah|kwanzaa|mistletoe|nativity|\bnoel\b|holiday special|jingle|sleigh|reindeer|north pole|grinch|scrooge|nutcracker/i },
+    { id: 'newyear', name: "New Year's", emoji: '🎆', start: [12, 27], end: [1, 3], movieGenre: 'Comedy', movieSearch: 'new year',
+      strong: /new year|auld lang|hogmanay|ball drop|countdown to midnight/i },
+    { id: 'valentine', name: "Valentine's", emoji: '💘', start: [2, 1], end: [2, 14], movieGenre: 'Romance',
+      strong: /valentine|galentine|cupid/i }
+];
+const stripHtml = s => String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+function holidayNow() {
+    const z = zoned(NOW), v = z.m * 100 + z.d;
+    const inWin = h => { const s = h.start[0] * 100 + h.start[1], e = h.end[0] * 100 + h.end[1]; return s <= e ? v >= s && v <= e : v >= s || v <= e; };
+    const active = HOLIDAYS.find(inWin);
+    if (active) return { h: active, upcoming: false };
+    // Off-season: preview the next holiday on the calendar
+    const until = h => { const s = h.start[0] * 100 + h.start[1]; return s > v ? s - v : s + 1300 - v; };
+    return { h: HOLIDAYS.slice().sort((a, b) => until(a) - until(b))[0], upcoming: true };
+}
+
+// ---------- Episodes (TVmaze, cached) ----------
+async function fetchShowRecord(show) {
+    const k = imdbOf(show), old = CACHE.shows[k] || {};
+    const known = byImdb.get(k);
+    let parts;
+    if (known) parts = known.sub_shows || [{ id: known.id, seasons: known.seasons }];
+    else parts = [{ id: old.tvm || (await getJSON(`https://api.tvmaze.com/lookup/shows?imdb=${k}`)).id, seasons: null }];
+    const eps = [], hol = {};
+    for (const p of parts) {
+        const list = await getJSON(`https://api.tvmaze.com/shows/${p.id}/episodes`);
+        for (const e of list) {
+            if (!e.season || !e.number || (p.seasons && !p.seasons.includes(e.season))) continue;
+            eps.push([e.season, e.number, e.name || `Episode ${e.number}`, e.airdate || '']);
+            const sum = stripHtml(e.summary);
+            for (const h of HOLIDAYS) {
+                const score = h.strong.test(e.name || '') ? 3 : h.strong.test(sum) ? 2 : 0;
+                if (score) (hol[h.id] = hol[h.id] || []).push([e.season, e.number, e.name || '', score, e.airdate || '']);
+            }
         }
-    } catch (e) { console.warn(`  ! no episodes for ${show.name}: ${e.message}`); }
-    epCache.set(k, eps);
-    return eps;
+    }
+    return { t: NOW, tvm: known ? null : parts[0].id, eps, hol };
+}
+
+async function showRecord(show) {
+    const k = imdbOf(show); if (!k) return null;
+    const rec = CACHE.shows[k];
+    if (isFresh(rec, SHOW_TTL) || !budgetLeft()) return rec || null;
+    try { CACHE.shows[k] = await fetchShowRecord(show); }
+    catch (e) { console.warn(`  ! ${show.name}: ${e.message}`); CACHE.shows[k] = Object.assign({}, rec || { eps: [], hol: {} }, { t: NOW, err: true }); }
+    return CACHE.shows[k];
+}
+
+const today = () => new Date(NOW).toISOString().slice(0, 10);
+async function episodesFor(show) {
+    const rec = await showRecord(show);
+    return rec ? rec.eps.filter(e => !e[3] || e[3] <= today()).map(e => ({ season: e[0], number: e[1], name: e[2] })) : [];
 }
 async function episodeFor(slot) {
-    if (OFFLINE) return null;
     const eps = await episodesFor(slot.show);
     if (!eps.length) return null;
     return eps[Math.floor(seeded(hashStr(slot.key))() * eps.length)];
 }
 const epLabel = e => e ? `S${e.season}E${e.number} “${e.name}”` : '';
+
+// Refresh the oldest/missing show records, as far as this run's time budget allows
+async function warmCache(shows) {
+    const todo = shows.filter(s => imdbOf(s) && !isFresh(CACHE.shows[imdbOf(s)], SHOW_TTL))
+        .sort((a, b) => ((CACHE.shows[imdbOf(a)] || {}).t || 0) - ((CACHE.shows[imdbOf(b)] || {}).t || 0));
+    let n = 0;
+    for (const s of todo) { if (!budgetLeft()) break; await showRecord(s); n++; }
+    const known = shows.filter(s => CACHE.shows[imdbOf(s)]).length;
+    console.log(`  episode data: refreshed ${n} shows this run · ${known}/${shows.length} cached${todo.length > n ? ` · ${todo.length - n} left for later runs` : ''}`);
+}
+
+// ---------- Movies (Stremio's Cinemeta catalog, cached) ----------
+async function moviePool(genre, max = 300) {
+    const key = 'imdbRating|' + (genre || '');
+    const rec = CACHE.cine[key];
+    if (isFresh(rec, CINE_TTL) || !budgetLeft()) return rec ? rec.metas : [];
+    const metas = [], seen = new Set();
+    try {
+        while (metas.length < max && budgetLeft()) {
+            const extra = [genre ? 'genre=' + encodeURIComponent(genre) : '', metas.length ? 'skip=' + metas.length : ''].filter(Boolean).join('&');
+            const data = await getJSON(`https://v3-cinemeta.strem.io/catalog/movie/imdbRating${extra ? '/' + extra : ''}.json`);
+            const page = (data.metas || []).filter(m => m && /^tt\d+$/.test(m.id || '') && m.poster && !seen.has(m.id));
+            if (!page.length) break;
+            page.forEach(m => { seen.add(m.id); metas.push({ id: m.id, name: m.name, poster: m.poster, background: m.background || undefined,
+                releaseInfo: m.releaseInfo || m.year || undefined, imdbRating: m.imdbRating || undefined, genres: m.genres || m.genre || undefined,
+                description: m.description ? String(m.description).slice(0, 400) : undefined }); });
+        }
+        CACHE.cine[key] = { t: NOW, metas };
+    } catch (e) {
+        console.warn(`  ! movie list (${genre || 'all'}): ${e.message}`);
+        if (rec) return rec.metas;
+        CACHE.cine[key] = { t: NOW, err: true, metas: [] };
+    }
+    return metas;
+}
+// Movies *about* a holiday, via Stremio's catalog search (ranked by rating, best first)
+async function movieSearchPool(term) {
+    const key = 'search|' + term;
+    const rec = CACHE.cine[key];
+    if (isFresh(rec, CINE_TTL) || !budgetLeft()) return rec ? rec.metas : [];
+    try {
+        const data = await getJSON(`https://v3-cinemeta.strem.io/catalog/movie/top/search=${encodeURIComponent(term)}.json`);
+        const metas = (data.metas || []).filter(m => m && /^tt\d+$/.test(m.id || '') && m.poster)
+            .map(m => ({ id: m.id, name: m.name, poster: m.poster, background: m.background || undefined,
+                releaseInfo: m.releaseInfo || m.year || undefined, imdbRating: m.imdbRating || undefined, genres: m.genres || m.genre || undefined,
+                description: m.description ? String(m.description).slice(0, 400) : undefined }))
+            .sort((a, b) => (parseFloat(b.imdbRating) || 0) - (parseFloat(a.imdbRating) || 0));
+        CACHE.cine[key] = { t: NOW, metas };
+        return metas;
+    } catch (e) {
+        console.warn(`  ! movie search (${term}): ${e.message}`);
+        return rec ? rec.metas : [];
+    }
+}
+
+function dailyShuffle(list, salt, n) {
+    const a = list.slice(), r = seeded(hashStr(salt + '|' + dayKey(broadcastStart(NOW))));
+    for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+    return a.slice(0, n);
+}
+const moviePreview = (m, note) => Object.assign({ type: 'movie', posterShape: 'poster' }, m,
+    { imdbRating: m.imdbRating ? String(m.imdbRating) : undefined, description: [note, m.description].filter(Boolean).join('\n\n') });
 
 // ---------- Catalogs ----------
 const preview = (s, extra) => Object.assign({ id: imdbOf(s), type: 'series', name: s.name, poster: posterOf(s), posterShape: 'poster' }, extra);
@@ -172,17 +299,18 @@ function buildList(list, label) {
         preview(s, { releaseInfo: `#${s.rank}`, description: `#${s.rank} on ${label}.` }));
 }
 
-function buildRandom() {
+function allSeries() {
     const pool = new Map();
     const add = (s, from) => { const k = imdbOf(s); if (k && !s.movie && !pool.has(k)) pool.set(k, { s, from }); };
     SHOWS.forEach(s => add(s, 'Now Showing picks'));
     NYT.forEach(s => add(s, `NYT #${s.rank}`));
     RT.forEach(s => add(s, `RT Comedy #${s.rank}`));
     BBC.forEach(s => add(s, `BBC #${s.rank}`));
-    const all = [...pool.values()];
-    const r = seeded(hashStr('random|' + dayKey(broadcastStart(NOW))));
-    for (let i = all.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [all[i], all[j]] = [all[j], all[i]]; }
-    return all.slice(0, 40).map(({ s, from }) => preview(s, { description: `🎲 Today's random pick (${from}). New picks every morning at 6.` }));
+    return [...pool.values()];
+}
+
+function buildRandom() {
+    return dailyShuffle(allSeries(), 'random', 40).map(({ s, from }) => preview(s, { description: `🎲 Today's random pick (${from}). New picks every morning at 6.` }));
 }
 
 function buildPicks() {
@@ -190,19 +318,65 @@ function buildPicks() {
         .map(s => preview(s, { genres: [s.category], description: `From the Now Showing starter lineup (${s.category}).` }));
 }
 
+async function buildHolidayShows() {
+    const { h, upcoming } = holidayNow();
+    const rows = [];
+    for (const { s } of allSeries()) {
+        const rec = CACHE.shows[imdbOf(s)];
+        const hits = rec && rec.hol && rec.hol[h.id] ? rec.hol[h.id].filter(e => !e[4] || e[4] <= today()) : [];
+        const uniq = [...new Map(hits.map(e => [`${e[0]}|${e[1]}|${e[2]}`, e])).values()];
+        if (uniq.length) rows.push({ s, hits: uniq.sort((a, b) => b[3] - a[3] || a[0] - b[0] || a[1] - b[1]) });
+    }
+    rows.sort((a, b) => b.hits.length - a.hits.length || a.s.name.localeCompare(b.s.name));
+    return rows.slice(0, 60).map(({ s, hits }) => preview(s, {
+        releaseInfo: `${hits.length} ${h.name} ep${hits.length === 1 ? '' : 's'}`,
+        description: [
+            upcoming ? `${h.emoji} Coming up: ${h.name}. Get a head start with these.` : `${h.emoji} ${h.name} episodes of ${s.name}:`,
+            ...hits.slice(0, 5).map(e => `• S${e[0]}E${e[1]} “${e[2]}”`),
+            hits.length > 5 ? `…and ${hits.length - 5} more` : '',
+            'Found by Now Showing\'s Holiday Mode.'
+        ].filter(Boolean).join('\n')
+    }));
+}
+
+async function buildMovieNight() {
+    const pool = await moviePool('', 300);
+    return dailyShuffle(pool, 'movienight', 30).map(m => moviePreview(m, '🎬 Tonight\'s Movie Night pick from Stremio\'s top-rated films. Reshuffled every morning at 6.'));
+}
+
+async function buildHolidayMovies() {
+    const { h, upcoming } = holidayNow();
+    let pool = [], kind = `top-rated ${h.movieGenre.toLowerCase()} pick`;
+    if (h.movieSearch) {
+        // Holiday-themed titles first (best-rated 40), topped up with the genre if the search comes back thin
+        pool = (await movieSearchPool(h.movieSearch)).slice(0, 40);
+        kind = `${h.name} movie`;
+    }
+    if (pool.length < 15) {
+        const seen = new Set(pool.map(m => m.id));
+        pool = pool.concat((await moviePool(h.movieGenre, 200)).filter(m => !seen.has(m.id)));
+        if (!h.movieSearch || pool.length > 40) kind = h.movieSearch ? `${h.name} or ${h.movieGenre.toLowerCase()} pick` : kind;
+    }
+    return dailyShuffle(pool, 'holmovies|' + h.id, 30).map(m => moviePreview(m,
+        `${h.emoji} ${upcoming ? 'Coming up: ' + h.name : h.name} movie night: ${/^[aeiou]/i.test(kind) ? 'an' : 'a'} ${kind}. Reshuffled every morning at 6.`));
+}
+
 const CATALOGS = [
-    { id: 'ns-onnow', name: '📺 On Now', build: buildOnNow },
-    { id: 'ns-random', name: '🎲 Random Picks', build: buildRandom },
-    { id: 'ns-nyt', name: '🗽 NYT Top 100', build: () => buildList(NYT, "the New York Times' 100 Best TV Shows of the 21st Century") },
-    { id: 'ns-rt', name: '🍅 RT Comedy Top 100', build: () => buildList(RT, "Rotten Tomatoes' Best Comedy Series of All Time") },
-    { id: 'ns-bbc', name: '🇬🇧 BBC Top 100', build: () => buildList(BBC, "BBC Culture's 100 Greatest TV Series of the 21st Century") },
-    { id: 'ns-picks', name: '⭐ Now Showing Picks', build: buildPicks }
+    { id: 'ns-onnow', type: 'series', name: '📺 On Now', build: buildOnNow },
+    { id: 'ns-random', type: 'series', name: '🎲 Random Picks', build: buildRandom },
+    { id: 'ns-holiday', type: 'series', name: '🎉 Holiday Specials', build: buildHolidayShows },
+    { id: 'ns-nyt', type: 'series', name: '🗽 NYT Top 100', build: () => buildList(NYT, "the New York Times' 100 Best TV Shows of the 21st Century") },
+    { id: 'ns-rt', type: 'series', name: '🍅 RT Comedy Top 100', build: () => buildList(RT, "Rotten Tomatoes' Best Comedy Series of All Time") },
+    { id: 'ns-bbc', type: 'series', name: '🇬🇧 BBC Top 100', build: () => buildList(BBC, "BBC Culture's 100 Greatest TV Series of the 21st Century") },
+    { id: 'ns-picks', type: 'series', name: '⭐ Now Showing Picks', build: buildPicks },
+    { id: 'ns-movienight', type: 'movie', name: '🎬 Movie Night', build: buildMovieNight },
+    { id: 'ns-holidaymovies', type: 'movie', name: '🎉 Holiday Movie Night', build: buildHolidayMovies }
 ];
 
 // ---------- Write ----------
 (async () => {
     const addonDir = path.join(OUT, 'addon');
-    fs.mkdirSync(path.join(addonDir, 'catalog', 'series'), { recursive: true });
+    for (const t of ['series', 'movie']) fs.mkdirSync(path.join(addonDir, 'catalog', t), { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'index.html'), path.join(OUT, 'index.html'));
     const logo = path.join(__dirname, 'logo.png');
     const hasLogo = fs.existsSync(logo);
@@ -212,10 +386,10 @@ const CATALOGS = [
         id: 'community.nowshowing',
         version: VERSION,
         name: 'Now Showing',
-        description: 'TV lists and a live TV Guide from the Now Showing episode randomizer: what\'s on now across retro channels, daily random picks, and the NYT, Rotten Tomatoes and BBC top-100 lists.',
+        description: 'TV lists and a live TV Guide from the Now Showing episode randomizer: what\'s on now across retro channels, daily random picks, holiday specials, movie night, and the NYT, Rotten Tomatoes and BBC top-100 lists. Catalogs only; no streams.',
         resources: ['catalog'],
-        types: ['series'],
-        catalogs: CATALOGS.map(c => ({ type: 'series', id: c.id, name: c.name })),
+        types: ['series', 'movie'],
+        catalogs: CATALOGS.map(c => ({ type: c.type, id: c.id, name: c.name })),
         behaviorHints: { configurable: false, configurationRequired: false },
         // Ownership verification for the stremio-addons.net listing (public by design)
         stremioAddonsConfig: {
@@ -226,10 +400,20 @@ const CATALOGS = [
     if (process.env.ADDON_BASE_URL && hasLogo) manifest.logo = process.env.ADDON_BASE_URL.replace(/\/$/, '') + '/addon/logo.png';
     fs.writeFileSync(path.join(addonDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
+    const results = {};
+    // 1. Time-sensitive rows first, while there's plenty of fetch budget
+    results['ns-onnow'] = await buildOnNow();
+    // 2. Movies (a few requests, cached for ~a day)
+    results['ns-movienight'] = await buildMovieNight();
+    results['ns-holidaymovies'] = await buildHolidayMovies();
+    // 3. Spend what's left of the budget refreshing episode data for the holiday row
+    await warmCache(allSeries().map(x => x.s));
     for (const c of CATALOGS) {
-        const metas = await c.build();
-        fs.writeFileSync(path.join(addonDir, 'catalog', 'series', `${c.id}.json`), JSON.stringify({ metas }));
-        console.log(`  ${c.name.padEnd(22)} ${String(metas.length).padStart(3)} items`);
+        const metas = results[c.id] || await c.build();
+        fs.writeFileSync(path.join(addonDir, 'catalog', c.type, `${c.id}.json`), JSON.stringify({ metas }));
+        console.log(`  ${c.name.padEnd(24)} ${c.type.padEnd(6)} ${String(metas.length).padStart(3)} items`);
     }
-    console.log(`Built Now Showing addon v${VERSION} → ${addonDir}  (schedule time zone ${TZ}, ${OFFLINE ? 'offline' : 'online'})`);
+    saveCache();
+    const { h, upcoming } = holidayNow();
+    console.log(`Built Now Showing addon v${VERSION} → ${addonDir}  (time zone ${TZ}, holiday: ${h.name}${upcoming ? ' (upcoming)' : ''}, ${OFFLINE ? 'offline' : 'online'}, ${Math.round((Date.now() - runStart) / 1000)}s)`);
 })().catch(e => { console.error(e); process.exit(1); });

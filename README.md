@@ -1,5 +1,4 @@
 # 🎬 Now Showing
-https://papaserf.github.io/now-showing/
 
 **A random episode picker and personal TV channel for [Stremio](https://www.stremio.com/).**
 
@@ -162,19 +161,23 @@ Now Showing also comes as a **Stremio addon**, so its lists and TV Guide show up
 |---|---|
 | 📺 **On Now** | What's airing right now on each TV Guide channel (LAFF, TOON, DRMA, NYT, RT, BBC), with the episode and what's up next |
 | 🎲 **Random Picks** | 40 shows from all the lists, reshuffled every morning at 6 |
+| 🎉 **Holiday Specials** | Shows with Halloween, Thanksgiving, Christmas, New Year's or Valentine's episodes, listing the episodes. Off-season, it previews the next holiday |
+| 🎬 **Movie Night** | 30 picks from Stremio's top-rated movies, reshuffled every morning at 6 |
+| 🎉 **Holiday Movie Night** | Movies for the current holiday: Christmas, Thanksgiving and New Year's titles, Halloween horror, Valentine's romance |
 | 🗽 **NYT Top 100** · 🍅 **RT Comedy Top 100** · 🇬🇧 **BBC Top 100** | The ranked lists, with the rank under each poster |
 | ⭐ **Now Showing Picks** | The app's starter lineup |
 
 **Install:** open the hosted app, then **📊 Stats → 🧩 Add to Stremio**. For Stremio Web or another device, use **📋 Copy addon link** and paste it into Stremio's **Addons** page. The link is `https://<your-username>.github.io/<repo-name>/addon/manifest.json`.
 
-**How it works:** the addon is plain JSON files, with no server. `addon/build.js` reads the lists straight out of `index.html`, so the app and the addon always match, and writes Stremio catalog files. The GitHub workflow reruns it **every 30 minutes** and publishes the result with the site. The addon only adds *rows of shows*. Playback, streams and your watch history stay in Stremio and in the app.
+**How it works:** the addon is plain JSON files, with no server. `addon/build.js` reads the lists straight out of `index.html`, so the app and the addon always match, and writes Stremio catalog files. The GitHub workflow reruns it **every 30 minutes** and publishes the result with the site. Episode and movie data is cached between runs (episodes refresh weekly), so after the first hour each run only fetches what's changed. The addon only adds *rows of shows*. Playback, streams and your watch history stay in Stremio and in the app.
 
 **Notes:**
 - **Schedule time zone:** set by `ADDON_TZ` in `.github/workflows/pages.yml` (default `America/Chicago`).
 - **Your lobby isn't included:** the addon's channels use the app's built-in lineup and lists, since your personal lobby lives on your device.
 - **Timing:** GitHub can delay scheduled runs by a few minutes, so "On Now" may lag slightly at the top of the hour.
 - **Inactivity:** GitHub pauses scheduled workflows in repos with no activity for 60 days; any push turns them back on.
-- **Build it yourself:** `node addon/build.js --out _site` (Node 18+). Add `--offline` to skip episode lookups.
+- **Holiday row warm-up:** after you first deploy, the holiday row fills in over the first couple of runs while episode data is collected.
+- **Build it yourself:** `node addon/build.js --out _site` (Node 18+). Add `--offline` to use only cached data.
 
 ---
 
