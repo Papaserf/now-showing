@@ -216,7 +216,12 @@ const CATALOGS = [
         resources: ['catalog'],
         types: ['series'],
         catalogs: CATALOGS.map(c => ({ type: 'series', id: c.id, name: c.name })),
-        behaviorHints: { configurable: false, configurationRequired: false }
+        behaviorHints: { configurable: false, configurationRequired: false },
+        // Ownership verification for the stremio-addons.net listing (public by design)
+        stremioAddonsConfig: {
+            issuer: 'https://stremio-addons.net',
+            signature: 'eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..NiE-r8L_vZT1gb7z3PVN5g.sSfXf6UHN1JpJVNb4YdmdACrl2Uv4OXCLbmXCqn4IgAvhhdB1_q8b8B2FwItVSUuUZ1myW6fEsP3nFhU84aDB_nkhJPu_DHpvXFty-uGvKYQ6fZjmB0piPivvB9Qcskj.LvoAOpU1a8j0IDXnN4mjrg'
+        }
     };
     if (process.env.ADDON_BASE_URL && hasLogo) manifest.logo = process.env.ADDON_BASE_URL.replace(/\/$/, '') + '/addon/logo.png';
     fs.writeFileSync(path.join(addonDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
