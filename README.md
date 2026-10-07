@@ -1,4 +1,5 @@
 # 🎬 Now Showing
+https://papaserf.github.io/now-showing/
 
 **A random episode picker and personal TV channel for [Stremio](https://www.stremio.com/).**
 
